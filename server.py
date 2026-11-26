@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 
 from PIL import Image as PILImage
 from mcp.server.fastmcp import FastMCP, Image
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -53,6 +54,15 @@ mcp = FastMCP(
     host=HOST,
     port=PORT,
     stateless_http=True,
+    # Railway 适配（与 wallet-mcp 相同的两处修复）：
+    # 1) json_response=True：返回普通 JSON 而非 SSE 流
+    # 2) 关闭 DNS rebinding 防护：默认只接受 Host=localhost，
+    #    部署到公网域名会返回 421 Invalid Host header。
+    #    认证由 Bearer Token 中间件负责，关闭该防护不降低安全性。
+    json_response=True,
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=False
+    ),
 )
 
 
@@ -78,11 +88,18 @@ class MCPBearerAuthMiddleware:
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "http" and scope.get("path", "").startswith("/mcp"):
             supplied = ""
+            extra = ""
             for name, value in scope.get("headers", []):
                 if name.lower() == b"authorization":
                     supplied = value.decode("latin-1")
-                    break
-            if not hmac.compare_digest(supplied, f"Bearer {TOKEN}"):
+                elif name.lower() == b"x-phone-token":
+                    extra = value.decode("latin-1")
+            # 除 Authorization: Bearer 外，也接受 x-phone-token 头
+            # （部分 MCP 客户端如 Kelivo 见 Authorization 头会误触发 OAuth 流程）
+            ok = hmac.compare_digest(supplied, f"Bearer {TOKEN}") or (
+                extra and hmac.compare_digest(extra, TOKEN)
+            )
+            if not ok:
                 response = JSONResponse({"error": "unauthorized"}, status_code=401)
                 await response(scope, receive, send)
                 return
